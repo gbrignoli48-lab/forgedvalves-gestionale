@@ -184,8 +184,118 @@ with tab_comm:
                 except Exception as e:
                     st.error(f"Errore: {e}")
 
+ISTRUZIONI_VENDITE = """
+Sei l'Ufficio Vendite di ForgedValves (valvole forgiate per oil & gas, energia, chimico, navale).
+Ricevi: (1) l'offerta emessa, (2) la conferma o l'ordine del cliente, (3) l'eventuale
+numero d'ordine del cliente. Produci in italiano una SCHEDA ORDINE con queste sezioni:
+1. RIFERIMENTI: cliente, n. ordine cliente (se noto), riferimento offerta.
+2. RIGHE D'ORDINE: per ogni riga tipo valvola, diametro, rating ASME, estremità, materiale,
+   quantità, norme/opzioni speciali (NACE, fire-safe, criogenico, attuatore).
+3. CONTROLLO DI COERENZA offerta/conferma: elenca ogni differenza o dato discordante
+   (quantità, specifiche, prezzi, consegna, condizioni). Se tutto coincide scrivi
+   "Nessuna discrepanza rilevata".
+4. DATI MANCANTI o da confermare con il cliente.
+Regole: usa solo informazioni presenti nei testi ricevuti; non inventare prezzi, date o
+numeri (se un dato manca scrivi [DA DEFINIRE]); non scrivere mai che l'ordine è approvato:
+la verifica spetta a una persona.
+"""
+STATI_ORD = ["da_verificare", "confermato", "in_pianificazione", "annullato"]
+
+
+def num_ord(o):
+    return f"ORD-{o['creato_il'][:4]}-{o['id']:04d}"
+
+
 with tab_vend:
-    st.info("Ufficio Vendite: in arrivo nella tappa 4.")
+    st.subheader("Agente Vendite")
+    st.caption("Qui nascono gli ordini dalle offerte portate allo stato «confermata».")
+
+    if "msg_v" in st.session_state:
+        st.success(st.session_state.pop("msg_v"))
+
+    try:
+        tutte = db().table("offerte").select("*").order("id", desc=True).execute().data
+        ordini = db().table("ordini").select("*").order("id", desc=True).execute().data
+    except Exception as e:
+        tutte, ordini = [], []
+        st.error(f"Errore database: {e}")
+
+    mappa = {o["id"]: o for o in tutte}
+    usati = {r["offerta_id"] for r in ordini if r["stato"] != "annullato"}
+    disponibili = [o for o in tutte if o["stato"] == "confermata" and o["id"] not in usati]
+
+    if not disponibili:
+        st.info("Nessuna offerta confermata in attesa di ordine. Nella scheda Commerciale "
+                "porta un'offerta allo stato «confermata».")
+    else:
+        sel = st.selectbox(
+            "Offerta confermata",
+            disponibili,
+            format_func=lambda o: f"{numero(o)} · {o.get('cliente') or 'senza nome'}",
+        )
+        po = st.text_input("N. ordine del cliente (se presente)")
+        conferma = st.text_area("Conferma o ordine del cliente (incolla il testo)", height=150)
+        if st.button("Genera scheda ordine"):
+            if not conferma.strip():
+                st.warning("Incolla prima il testo della conferma del cliente.")
+            else:
+                with st.spinner("L'agente sta lavorando..."):
+                    try:
+                        client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+                        contenuto = (
+                            f"OFFERTA EMESSA ({numero(sel)}, cliente: {sel.get('cliente')}):\n{sel['bozza']}"
+                            f"\n\nCONFERMA DEL CLIENTE:\n{conferma}\n\nN. ORDINE CLIENTE: {po or 'non indicato'}"
+                        )
+                        testo, modello = genera(client, contenuto, ISTRUZIONI_VENDITE)
+                        st.session_state["n_scheda"] = st.session_state.get("n_scheda", 0) + 1
+                        st.session_state["scheda"] = {
+                            "offerta_id": sel["id"], "po": po, "conferma": conferma,
+                            "testo": testo, "modello": modello,
+                        }
+                    except Exception as e:
+                        st.error(f"Errore: {e}")
+
+    if "scheda" in st.session_state:
+        s = st.session_state["scheda"]
+        st.success("Scheda pronta: controlla soprattutto le discrepanze, poi salva l'ordine.")
+        testo_sc = st.text_area(
+            "Scheda ordine (modificabile)", value=s["testo"], height=400,
+            key=f"testo_sc_{st.session_state['n_scheda']}",
+        )
+        st.caption(f"Modello usato: {s['modello']}")
+        if st.button("💾 Salva ordine"):
+            try:
+                db().table("ordini").insert({
+                    "offerta_id": s["offerta_id"], "ordine_cliente": s["po"],
+                    "testo_conferma": s["conferma"], "scheda": testo_sc,
+                    "modello_ai": s["modello"],
+                }).execute()
+                del st.session_state["scheda"]
+                st.session_state["msg_v"] = "✅ Ordine salvato, in attesa di verifica."
+                st.rerun()
+            except Exception as e:
+                st.error(f"Errore nel salvataggio: {e}")
+
+    st.divider()
+    st.subheader("Ordini")
+    if not ordini:
+        st.caption("Nessun ordine salvato.")
+    for r in ordini[:20]:
+        off = mappa.get(r["offerta_id"])
+        rif = numero(off) if off else "offerta ?"
+        with st.expander(f"{num_ord(r)} · {rif} · {r['stato'].upper()}"):
+            if r.get("ordine_cliente"):
+                st.caption(f"N. ordine cliente: {r['ordine_cliente']}")
+            st.write(r["scheda"])
+            nuovo = st.selectbox(
+                "Stato", STATI_ORD, index=STATI_ORD.index(r["stato"]), key=f"stato_ord_{r['id']}"
+            )
+            if st.button("Aggiorna stato", key=f"agg_ord_{r['id']}"):
+                try:
+                    db().table("ordini").update({"stato": nuovo}).eq("id", r["id"]).execute()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Errore: {e}")
 
 with tab_pian:
     st.info("Ufficio Pianificazione: in arrivo nella tappa 5.")
