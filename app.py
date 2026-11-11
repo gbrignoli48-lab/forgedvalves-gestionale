@@ -3,9 +3,39 @@ from google import genai
 from google.genai import types
 
 # ---------------------------------------------------------------
-# IMPOSTAZIONI (se un giorno il modello non funziona, cambia solo qui)
+# MODELLI: l'app chiede a Google quali modelli può usare la tua chiave
 # ---------------------------------------------------------------
-MODELLO = "gemini-flash-latest"
+def elenco_modelli(client):
+    """Restituisce i modelli Flash utilizzabili, in ordine di preferenza."""
+    candidati = []
+    for m in client.models.list():
+        nome = m.name.replace("models/", "")
+        azioni = getattr(m, "supported_actions", None) or []
+        if "generateContent" not in azioni or "flash" not in nome:
+            continue
+        if any(x in nome for x in ["image", "tts", "audio", "live", "robotics", "embedding", "computer", "omni"]):
+            continue
+        candidati.append(nome)
+    candidati.sort(reverse=True)  # versioni più recenti prima
+    candidati.sort(key=lambda n: (("preview" in n or "exp" in n), ("lite" in n)))
+    return candidati
+
+
+def genera(client, testo, istruzioni):
+    """Prova i modelli disponibili uno alla volta finché uno risponde."""
+    ultimo_errore = None
+    for nome in elenco_modelli(client)[:5]:
+        try:
+            r = client.models.generate_content(
+                model=nome,
+                contents=testo,
+                config=types.GenerateContentConfig(system_instruction=istruzioni),
+            )
+            return r.text, nome
+        except Exception as e:
+            ultimo_errore = e
+    raise ultimo_errore or RuntimeError("Nessun modello disponibile per questa chiave.")
+
 
 ISTRUZIONI_COMMERCIALE = """
 Sei l'Ufficio Commerciale di ForgedValves, azienda che fornisce valvole forgiate
@@ -67,15 +97,10 @@ with tab_comm:
             with st.spinner("L'agente sta lavorando..."):
                 try:
                     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-                    risposta = client.models.generate_content(
-                        model=MODELLO,
-                        contents=richiesta,
-                        config=types.GenerateContentConfig(
-                            system_instruction=ISTRUZIONI_COMMERCIALE
-                        ),
-                    )
+                    testo, modello_usato = genera(client, richiesta, ISTRUZIONI_COMMERCIALE)
                     st.success("Bozza pronta (da verificare prima dell'invio)")
-                    st.write(risposta.text)
+                    st.write(testo)
+                    st.caption(f"Modello usato: {modello_usato}")
                 except Exception as e:
                     st.error(f"Errore: {e}")
 
