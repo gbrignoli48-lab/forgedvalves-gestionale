@@ -1,12 +1,36 @@
 import streamlit as st
 from google import genai
 from google.genai import types
+from supabase import create_client
+
+st.set_page_config(page_title="ForgedValves Gestionale", page_icon="🔧", layout="centered")
+
+STATI = ["bozza", "approvata", "inviata", "confermata", "rifiutata"]
+
+ISTRUZIONI_COMMERCIALE = """
+Sei l'Ufficio Commerciale di ForgedValves, azienda con sede a Gorla Minore (VA) che
+fornisce valvole forgiate (saracinesca, globo, ritegno, sfera, farfalla) per oil & gas,
+energia, chimico e navale.
+Ricevi la richiesta di un cliente e prepari una BOZZA di risposta in italiano.
+
+Contatti ufficiali (gli UNICI che puoi usare): info@forgedvalves.it - +39 392 178 7273.
+
+Regole:
+1. Inizia con una riga "Oggetto:" scritta dal punto di vista di ForgedValves
+   (es. "Oggetto: Vs. richiesta di offerta - valvole a sfera e ritegno").
+2. Estrai i dati tecnici: tipo valvola, diametro, rating ASME, estremità, materiale,
+   quantità, norme richieste (es. NACE, fire-safe, criogenico), attuatore.
+3. Elenca chiaramente i dati MANCANTI da chiedere al cliente.
+4. NON inventare mai prezzi, tempi di consegna, conformità, indirizzi email, numeri di
+   telefono o nomi di persone: se un dato non è noto scrivi [DA DEFINIRE].
+5. Tono professionale e sintetico. Firma: Ufficio Commerciale - ForgedValves.
+"""
+
 
 # ---------------------------------------------------------------
-# MODELLI: l'app chiede a Google quali modelli può usare la tua chiave
+# MODELLI GEMINI: l'app chiede a Google quali modelli può usare la tua chiave
 # ---------------------------------------------------------------
 def elenco_modelli(client):
-    """Restituisce i modelli Flash utilizzabili, in ordine di preferenza."""
     candidati = []
     for m in client.models.list():
         nome = m.name.replace("models/", "")
@@ -16,13 +40,12 @@ def elenco_modelli(client):
         if any(x in nome for x in ["image", "tts", "audio", "live", "robotics", "embedding", "computer", "omni"]):
             continue
         candidati.append(nome)
-    candidati.sort(reverse=True)  # versioni più recenti prima
+    candidati.sort(reverse=True)
     candidati.sort(key=lambda n: (("preview" in n or "exp" in n), ("lite" in n)))
     return candidati
 
 
 def genera(client, testo, istruzioni):
-    """Prova i modelli disponibili uno alla volta finché uno risponde."""
     ultimo_errore = None
     for nome in elenco_modelli(client)[:5]:
         try:
@@ -37,23 +60,20 @@ def genera(client, testo, istruzioni):
     raise ultimo_errore or RuntimeError("Nessun modello disponibile per questa chiave.")
 
 
-ISTRUZIONI_COMMERCIALE = """
-Sei l'Ufficio Commerciale di ForgedValves, azienda che fornisce valvole forgiate
-(saracinesca, globo, ritegno, sfera, farfalla) per oil & gas, energia, chimico e navale.
-Ricevi la richiesta di un cliente e prepari una BOZZA di risposta in italiano.
-Regole:
-1. Estrai i dati tecnici: tipo valvola, diametro, rating ASME, estremità, materiale,
-   quantità, norme richieste (es. NACE, fire-safe, criogenico), attuatore.
-2. Elenca chiaramente i dati MANCANTI da chiedere al cliente.
-3. NON inventare mai prezzi, tempi di consegna o conformità: scrivi [DA DEFINIRE].
-4. Tono professionale e sintetico.
-"""
+# ---------------------------------------------------------------
+# DATABASE
+# ---------------------------------------------------------------
+@st.cache_resource
+def db():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
-st.set_page_config(page_title="ForgedValves Gestionale", page_icon="🔧", layout="centered")
+
+def numero(o):
+    return f"OFF-{o['creato_il'][:4]}-{o['id']:04d}"
 
 
 # ---------------------------------------------------------------
-# PASSWORD: protegge l'app e la tua chiave API
+# PASSWORD
 # ---------------------------------------------------------------
 def controlla_password():
     if st.session_state.get("autorizzato"):
@@ -83,13 +103,19 @@ tab_comm, tab_vend, tab_pian, tab_qual = st.tabs(
 
 with tab_comm:
     st.subheader("Agente Commerciale")
-    st.caption("Incolla qui la richiesta del cliente (email o RFQ).")
+    st.caption("Piano gratuito Google: per ora usa solo richieste di prova o dati non sensibili.")
+
+    if "msg" in st.session_state:
+        st.success(st.session_state.pop("msg"))
+
+    cliente = st.text_input("Cliente")
     richiesta = st.text_area(
         "Richiesta cliente",
         height=180,
-        placeholder="Es: Buongiorno, ci servono 10 valvole a sfera trunnion 6\" classe 600, "
+        placeholder='Es: Buongiorno, ci servono 10 valvole a sfera trunnion 6" classe 600, '
         "flangiate, in A105, servizio NACE...",
     )
+
     if st.button("Genera bozza offerta"):
         if not richiesta.strip():
             st.warning("Scrivi prima una richiesta.")
@@ -97,10 +123,64 @@ with tab_comm:
             with st.spinner("L'agente sta lavorando..."):
                 try:
                     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-                    testo, modello_usato = genera(client, richiesta, ISTRUZIONI_COMMERCIALE)
-                    st.success("Bozza pronta (da verificare prima dell'invio)")
-                    st.write(testo)
-                    st.caption(f"Modello usato: {modello_usato}")
+                    testo, modello = genera(client, richiesta, ISTRUZIONI_COMMERCIALE)
+                    st.session_state["n_bozza"] = st.session_state.get("n_bozza", 0) + 1
+                    st.session_state["bozza"] = {
+                        "cliente": cliente,
+                        "richiesta": richiesta,
+                        "testo": testo,
+                        "modello": modello,
+                    }
+                except Exception as e:
+                    st.error(f"Errore: {e}")
+
+    if "bozza" in st.session_state:
+        b = st.session_state["bozza"]
+        st.success("Bozza pronta: controllala, correggila se serve, poi salvala.")
+        testo_mod = st.text_area(
+            "Bozza (modificabile)",
+            value=b["testo"],
+            height=400,
+            key=f"testo_mod_{st.session_state['n_bozza']}",
+        )
+        st.caption(f"Modello usato: {b['modello']}")
+        if st.button("💾 Salva offerta"):
+            try:
+                db().table("offerte").insert(
+                    {
+                        "cliente": b["cliente"],
+                        "richiesta": b["richiesta"],
+                        "bozza": testo_mod,
+                        "modello_ai": b["modello"],
+                    }
+                ).execute()
+                del st.session_state["bozza"]
+                st.session_state["msg"] = "✅ Offerta salvata."
+                st.rerun()
+            except Exception as e:
+                st.error(f"Errore nel salvataggio: {e}")
+
+    st.divider()
+    st.subheader("Offerte salvate")
+    try:
+        offerte = db().table("offerte").select("*").order("id", desc=True).limit(20).execute().data
+    except Exception as e:
+        offerte = []
+        st.error(f"Errore database: {e}")
+
+    if not offerte:
+        st.caption("Nessuna offerta salvata.")
+    for o in offerte:
+        titolo = f"{numero(o)} · {o.get('cliente') or 'senza nome'} · {o['stato'].upper()}"
+        with st.expander(titolo):
+            st.write(o["bozza"])
+            nuovo = st.selectbox(
+                "Stato", STATI, index=STATI.index(o["stato"]), key=f"stato_{o['id']}"
+            )
+            if st.button("Aggiorna stato", key=f"agg_{o['id']}"):
+                try:
+                    db().table("offerte").update({"stato": nuovo}).eq("id", o["id"]).execute()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Errore: {e}")
 
